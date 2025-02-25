@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
-from Shopforhome.recommendation import Recommendation
+from recommendation import Recommendation
 
 class Product(BaseModel):
     product_id: int
