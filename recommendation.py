@@ -1,126 +1,177 @@
 import faiss
 import numpy as np
 import pandas as pd
+import torch
+import requests
+from PIL import Image
+from io import BytesIO
 import os
-import json
-from typing import List, Dict, Union
-from sentence_transformers import SentenceTransformer
+from typing import List, Dict, Tuple, Optional
+from transformers import CLIPProcessor, CLIPModel
 
-class Recommendation:
+class EnhancedRecommendationSystem:
     def __init__(self, model_path='models'):
-        
         self.model_path = model_path
         os.makedirs(model_path, exist_ok=True)
         
-        self.text_model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
-        self.index = None
-        self.products_df = None
-        self.feature_embeddings = None
-        self.feature_cols = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        self.model.to(self.device)
         
-        self.load_data()
-    
-    def preprocess_features(self, products: List[Dict]) -> pd.DataFrame:
-        df = pd.DataFrame(products)
-        df['price_normalized'] = (df['price'] - df['price'].min()) / (df['price'].max() - df['price'].min())
-        df = pd.get_dummies(df, columns=['category', 'color'])
+        self.text_index = None
+        self.multimodal_index = None
+        
+        self.products_df = None
+        self.text_embeddings = None
+        self.multimodal_embeddings = None
+        self._image_products = set()  # Store product IDs with valid images
 
-        descriptions = df['description'].tolist()
-        desc_embeddings = self.text_model.encode(descriptions)
+    def _get_text_embedding(self, text: str) -> np.ndarray:
+        inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
+        with torch.no_grad():
+            text_features = self.model.get_text_features(**inputs.to(self.device))
+        return text_features.cpu().numpy().astype('float32')[0]
 
-        for i in range(desc_embeddings.shape[1]):
-            df[f'desc_embedding_{i}'] = desc_embeddings[:, i]
+    def _get_image_embedding(self, image_path: str) -> np.ndarray:
+        if image_path.startswith(('http://', 'https://')):
+            image = Image.open(BytesIO(requests.get(image_path).content)).convert("RGB")
+        else:
+            image = Image.open(image_path).convert("RGB")
+        
+        inputs = self.processor(images=image, return_tensors="pt")
+        with torch.no_grad():
+            image_features = self.model.get_image_features(**inputs.to(self.device))
+        return image_features.cpu().numpy().astype('float32')[0]
 
-        return df
-    
+    def _get_simple_text_embedding(self, product: Dict) -> np.ndarray:
+        text = f"{product['name']}, {product['category']}, {product['description']}"
+        return self._get_text_embedding(text)
+
+    def _get_multimodal_embedding(self, product: Dict) -> np.ndarray:
+        text = f"{product['name']}, {product['category']}"
+        text_embedding = self._get_text_embedding(text)
+        
+        if product.get('image_path'):
+            try:
+                image_path = product['image_path'].split(',')[0] if ',' in product['image_path'] else product['image_path']
+                image_embedding = self._get_image_embedding(image_path)
+                combined = (text_embedding + image_embedding) / 2
+                self._image_products.add(product['product_id'])  # Track that this product has a valid image
+                return combined
+            except Exception as e:
+                print(f"Error processing image for product {product.get('product_id', 'unknown')}: {str(e)}")
+        
+        return text_embedding
+
     def build_index(self, products: List[Dict]):
         self.products_df = pd.DataFrame(products)
-        processed_df = self.preprocess_features(products)
-
-        self.feature_cols = processed_df.select_dtypes(include=[np.number]).columns
-        self.feature_embeddings = processed_df[self.feature_cols].values.astype('float32')
-        self.feature_embeddings = np.ascontiguousarray(self.feature_embeddings)
+        self._image_products = set()  # Reset image product tracking
         
-        faiss.normalize_L2(self.feature_embeddings)
-
-        self.index = faiss.IndexFlatIP(self.feature_embeddings.shape[1])
-        self.index.add(self.feature_embeddings)
+        text_embeddings = []
+        multimodal_embeddings = []
         
-        self.save_data()
-
-    def get_recommendations(self, product_id: int, n_recommendations: int = 6) -> List[Dict]:
-        if self.index is None:
-            raise ValueError("Index not built. Please call build_index() first")
-    
-        product_idx = self.products_df.index[self.products_df['product_id'] == product_id].tolist()
-        if not product_idx:
-            raise ValueError(f"Product with id {product_id} not found")
-    
-        query_vector = self.feature_embeddings[product_idx[0]].reshape(1, -1)
-
-        distances, indices = self.index.search(query_vector, n_recommendations + 1)
-
-        indices = indices[0][1:]  
-        distances = distances[0][1:]
-
-        recommendations = []
-        for idx, score in zip(indices, distances):
-            product = self.products_df.iloc[idx].to_dict()
-            # product['similarity_score'] = float(score)
-            recommendations.append(product)
-
-        return recommendations
-    
-    def update_index(self, new_products: List[Dict]):
-        if self.index is None:
-            self.build_index(new_products)
-        else:
-            new_products_df = pd.DataFrame(new_products)
-            self.products_df = pd.concat([self.products_df, new_products_df], ignore_index=True)
+        for product in products:
+            text_embeddings.append(self._get_simple_text_embedding(product))
             
-            new_df = self.preprocess_features(new_products)
-            new_embeddings = new_df[self.feature_cols].values.astype('float32')
-            
-            faiss.normalize_L2(new_embeddings)
-            self.index.add(new_embeddings)
-            
-            self.feature_embeddings = np.vstack([self.feature_embeddings, new_embeddings])
-            
-            self.save_data()
-    
-    def save_data(self):
+            mm_embedding = self._get_multimodal_embedding(product)
+            multimodal_embeddings.append(mm_embedding)
         
-        if self.index is not None:
-            faiss.write_index(self.index, os.path.join(self.model_path, 'product_index.faiss'))
+        self.text_embeddings = np.array(text_embeddings).astype('float32')
+        self.multimodal_embeddings = np.array(multimodal_embeddings).astype('float32')
         
+        self.text_embeddings = np.ascontiguousarray(self.text_embeddings)
+        self.multimodal_embeddings = np.ascontiguousarray(self.multimodal_embeddings)
+        
+        faiss.normalize_L2(self.text_embeddings)
+        faiss.normalize_L2(self.multimodal_embeddings)
+        
+        self.text_index = faiss.IndexFlatIP(self.text_embeddings.shape[1])
+        self.text_index.add(self.text_embeddings)
+        
+        self.multimodal_index = faiss.IndexFlatIP(self.multimodal_embeddings.shape[1])
+        self.multimodal_index.add(self.multimodal_embeddings)
+        
+        self._save_data()
+
+    def recommend(self, product_id: str, n: int = 6) -> List[Dict]:
+        idx = self.products_df.index[self.products_df['product_id'] == product_id].tolist()
+        if not idx:
+            raise ValueError(f"Product with ID {product_id} not found")
+        
+        query = self.text_embeddings[idx[0]].reshape(1, -1)
+        faiss.normalize_L2(query)
+        distances, indices = self.text_index.search(query, n+1)
+        
+        return [self.products_df.iloc[i].to_dict() for i in indices[0][1:]]
+
+    def recommend_by_text(self, query_text: str, n: int = 6) -> List[Dict]:
+        text_embedding = self._get_text_embedding(query_text)
+        
+        query = np.ascontiguousarray(text_embedding.reshape(1, -1))
+        faiss.normalize_L2(query)
+        
+        distances, indices = self.text_index.search(query, n)
+        
+        return [self.products_df.iloc[i].to_dict() for i in indices[0]]
+
+    def recommend_by_image(self, image_path: str, n: int = 6) -> List[Dict]:
+        try:
+            image_embedding = self._get_image_embedding(image_path)
+            
+            dummy_text = ""  
+            text_embedding = self._get_text_embedding(dummy_text)
+            
+            query = (image_embedding * 0.8 + text_embedding * 0.2)
+            
+            query = np.ascontiguousarray(query.reshape(1, -1))
+            faiss.normalize_L2(query)
+            
+            distances, indices = self.multimodal_index.search(query, n)
+            
+            results = []
+            for i in indices[0]:
+                results.append(self.products_df.iloc[i].to_dict())
+            
+            # Prioritize results with images but without adding 'has_image' field
+            results_with_images = [r for r in results if r['product_id'] in self._image_products]
+            results_without_images = [r for r in results if r['product_id'] not in self._image_products]
+            
+            return results_with_images + results_without_images[:n-len(results_with_images)]
+            
+        except Exception as e:
+            raise ValueError(f"Image processing failed: {str(e)}")
+
+    def _save_data(self):
+        if self.text_index:
+            faiss.write_index(self.text_index, os.path.join(self.model_path, 'text_index.faiss'))
+        if self.multimodal_index:
+            faiss.write_index(self.multimodal_index, os.path.join(self.model_path, 'multimodal_index.faiss'))
         if self.products_df is not None:
+            # Save product data without the 'has_image' column
             self.products_df.to_csv(os.path.join(self.model_path, 'products.csv'), index=False)
-        
-        if self.feature_embeddings is not None:
-            np.save(os.path.join(self.model_path, 'feature_embeddings.npy'), self.feature_embeddings)
             
-        if self.feature_cols is not None:
-            with open(os.path.join(self.model_path, 'feature_cols.json'), 'w') as f:
-                json.dump(list(self.feature_cols), f)
-    
+        # Save image products set
+        image_products_path = os.path.join(self.model_path, 'image_products.txt')
+        with open(image_products_path, 'w') as f:
+            for product_id in self._image_products:
+                f.write(f"{product_id}\n")
+
     def load_data(self):
-        index_path = os.path.join(self.model_path, 'product_index.faiss')
-        products_path = os.path.join(self.model_path, 'products.csv')
-        embeddings_path = os.path.join(self.model_path, 'feature_embeddings.npy')
-        feature_cols_path = os.path.join(self.model_path, 'feature_cols.json')
-        
-        if all(os.path.exists(p) for p in [index_path, products_path, embeddings_path, feature_cols_path]):
-            try:
-                self.index = faiss.read_index(index_path)
-                self.products_df = pd.read_csv(products_path)
-                self.feature_embeddings = np.load(embeddings_path)
-                
-                with open(feature_cols_path, 'r') as f:
-                    self.feature_cols = json.load(f)
-                
-                print("Successfully loaded index and data")
-                return True
-            except Exception as e:
-                print(f"Error loading data: {e}")
-        
-        return False
+        try:
+            self.text_index = faiss.read_index(os.path.join(self.model_path, 'text_index.faiss'))
+            self.multimodal_index = faiss.read_index(os.path.join(self.model_path, 'multimodal_index.faiss'))
+            self.products_df = pd.read_csv(os.path.join(self.model_path, 'products.csv'))
+            
+            # Load image products set
+            image_products_path = os.path.join(self.model_path, 'image_products.txt')
+            self._image_products = set()
+            if os.path.exists(image_products_path):
+                with open(image_products_path, 'r') as f:
+                    for line in f:
+                        self._image_products.add(line.strip())
+            
+            return True
+        except Exception as e:
+            print(f"Error loading data: {str(e)}")
+            return False

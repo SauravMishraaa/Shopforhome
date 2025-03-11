@@ -5,3 +5,7 @@ numpy
 pandas
 pymilvus
 uvicorn
+torch
+torchvision
+Pillow
+python-multipart
