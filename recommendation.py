@@ -133,7 +133,7 @@ class EnhancedRecommendationSystem:
             for i in indices[0]:
                 results.append(self.products_df.iloc[i].to_dict())
             
-            # Prioritize results with images but without adding 'has_image' field
+            
             results_with_images = [r for r in results if r['product_id'] in self._image_products]
             results_without_images = [r for r in results if r['product_id'] not in self._image_products]
             
@@ -148,10 +148,10 @@ class EnhancedRecommendationSystem:
         if self.multimodal_index:
             faiss.write_index(self.multimodal_index, os.path.join(self.model_path, 'multimodal_index.faiss'))
         if self.products_df is not None:
-            # Save product data without the 'has_image' column
+            
             self.products_df.to_csv(os.path.join(self.model_path, 'products.csv'), index=False)
             
-        # Save image products set
+       
         image_products_path = os.path.join(self.model_path, 'image_products.txt')
         with open(image_products_path, 'w') as f:
             for product_id in self._image_products:
@@ -163,7 +163,6 @@ class EnhancedRecommendationSystem:
             self.multimodal_index = faiss.read_index(os.path.join(self.model_path, 'multimodal_index.faiss'))
             self.products_df = pd.read_csv(os.path.join(self.model_path, 'products.csv'))
             
-            # Load image products set
             image_products_path = os.path.join(self.model_path, 'image_products.txt')
             self._image_products = set()
             if os.path.exists(image_products_path):
